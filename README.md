@@ -1,7 +1,7 @@
 # customer-support-triage-
 
 AI-powered banking customer support triage system built with FastAPI.  
-The system validates incoming tickets, classifies them using AI and rule-based fallback logic, routes them to the correct support destination, sends Slack notifications for technical issues, and stores ticket metadata in Google Sheets.
+The system validates incoming tickets, classifies them using AI and rule-based fallback logic, routes them to the correct support destination, sends Slack notifications for technical issues, sends SMTP emails for non-technical issues, and stores ticket metadata in Google Sheets.
 
 ## Features
 
@@ -16,6 +16,7 @@ The system validates incoming tickets, classifies them using AI and rule-based f
 - Google Sheets integration
 - Metadata logging
 - Delivery status tracking
+- SMTP email routing for non-technical tickets
 
 ## HW3 Modifications
 
@@ -59,7 +60,9 @@ For the HW3 requirements, the following updates were implemented in `main.py`:
 
 - Added Slack notification integration for technical issues.
 
-- Added Google Sheets integration for ticket storage.
+- Added real SMTP email routing for non-technical issues via `smtplib` and `email.message.EmailMessage`.
+
+- Added Google Sheets integration for ticket metadata storage and logging.
 
 - Added delivery status tracking:
   - `success`

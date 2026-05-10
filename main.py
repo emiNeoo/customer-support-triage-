@@ -1,6 +1,8 @@
 import os
 import re
 import httpx
+import smtplib
+from email.message import EmailMessage
 from datetime import datetime
 from typing import Optional
 from fastapi import FastAPI, HTTPException
@@ -159,6 +161,53 @@ async def notify_slack(ticket: TicketPayload, category: str) -> bool:
             return False
 
 
+def send_email(ticket: TicketPayload, category: str) -> bool:
+    """
+    Helper function to send an email using SMTP.
+    """
+    smtp_server = os.getenv("SMTP_SERVER")
+    smtp_port = os.getenv("SMTP_PORT", "587")
+    smtp_username = os.getenv("SMTP_USERNAME")
+    smtp_password = os.getenv("SMTP_PASSWORD")
+    from_email = os.getenv("FROM_EMAIL")
+
+    if not all([smtp_server, smtp_username, smtp_password, from_email]):
+        print("Warning: Missing SMTP configuration. Cannot send email.")
+        return False
+
+    if category == "billing":
+        to_email = os.getenv("FINANCE_EMAIL")
+    elif category == "fraud":
+        to_email = os.getenv("FRAUD_EMAIL")
+    elif category == "loan":
+        to_email = os.getenv("LOAN_EMAIL")
+    elif category == "card_issue":
+        to_email = os.getenv("CARD_EMAIL")
+    else:
+        to_email = os.getenv("SHARED_INBOX_EMAIL")
+
+    if not to_email:
+        print(f"Warning: No recipient email configured for category '{category}'.")
+        return False
+
+    msg = EmailMessage()
+    msg.set_content(f"Customer Name: {ticket.name}\nEmail: {ticket.email}\n\nMessage:\n{ticket.message}")
+    msg["Subject"] = f"New {category.replace('_', ' ').title()} Ticket"
+    msg["From"] = from_email
+    msg["To"] = to_email
+
+    try:
+        with smtplib.SMTP(smtp_server, int(smtp_port)) as server:
+            server.starttls()
+            server.login(smtp_username, smtp_password)
+            server.send_message(msg)
+        print(f"Successfully sent email to {to_email}")
+        return True
+    except Exception as e:
+        print(f"Failed to send email to {to_email}: {e}")
+        return False
+
+
 @app.post("/api/ticket")
 async def create_ticket(ticket: TicketPayload):
     # 1. Validation
@@ -175,9 +224,9 @@ async def create_ticket(ticket: TicketPayload):
             delivery_status = "success" if success else "failed"
             action_message = "Notification sent to Slack." if success else "Failed to send Slack notification."
         else:
-            print(f"Simulating email to {route}")
-            delivery_status = "success"
-            action_message = f"Simulated email to {route}."
+            success = send_email(ticket, category)
+            delivery_status = "success" if success else "failed"
+            action_message = f"Email sent to {route}." if success else f"Failed to send email to {route}."
     else:
         category, priority, route, delivery_status = "none", "none", "none", "none"
         action_message = "Ticket invalid. Saved as Invalid."
