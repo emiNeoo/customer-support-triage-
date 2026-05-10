@@ -1,9 +1,17 @@
 import os
+import re
 import httpx
+from datetime import datetime
+from typing import Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from groq import AsyncGroq
+
+try:
+    import gspread
+except ImportError:
+    gspread = None
 
 # Load environment variables from .env file
 load_dotenv()
@@ -16,35 +24,69 @@ SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 app = FastAPI(title="Customer Support Triage API")
 
 # Initialize Groq client
-# We initialize it conditionally to handle missing API keys gracefully at startup,
-# but it will fail during the API call if missing.
 groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-class TicketPayload(BaseModel):
-    customer_name: str
-    customer_email: str
-    message: str
+# Initialize Google Sheets
+try:
+    if gspread:
+        gc = gspread.service_account(filename=os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "credentials.json"))
+        sheet = gc.open(os.getenv("GOOGLE_SHEET_NAME", "Support Tickets")).sheet1
+    else:
+        sheet = None
+except Exception as e:
+    print(f"Warning: Could not connect to Google Sheets: {e}")
+    sheet = None
 
-async def classify_ticket(message: str) -> str:
-    """
-    Sends the message to the Groq API for classification.
-    Expects ONLY: "Billing", "Bug", "Feature Request", or "General".
-    """
+
+class TicketPayload(BaseModel):
+    name: Optional[str] = ""
+    email: Optional[str] = ""
+    message: Optional[str] = ""
+
+
+def validate_input(ticket: TicketPayload) -> tuple[str, list]:
+    errors = []
+    if not ticket.name or not ticket.name.strip():
+        errors.append("missing name")
+    if not ticket.email or not re.match(r"[^@]+@[^@]+\.[^@]+", ticket.email):
+        errors.append("invalid email")
+    if not ticket.message or not ticket.message.strip():
+        errors.append("missing message")
+    
+    status = "Valid" if not errors else "Invalid"
+    return status, errors
+
+
+async def classify_ticket(message: str) -> tuple[str, str]:
+    # Strong rule-based fallback for fraud detection
+    message_lower = message.lower()
+    fraud_keywords = [
+        "fraud", "stolen", "unauthorized", "suspicious", "hacked", 
+        "scam", "charged twice", "duplicate charge", "unknown transaction"
+    ]
+    if any(keyword in message_lower for keyword in fraud_keywords):
+        return "fraud", "high"
+
+    # Strong rule-based fallback for technical issues
+    tech_keywords = [
+        "crash", "crashes", "error", "bug", "login problem", 
+        "cannot login", "app not working", "server error", "technical issue"
+    ]
+    if any(keyword in message_lower for keyword in tech_keywords):
+        return "technical", "high"
+
     if not groq_client:
-        print("Warning: GROQ_API_KEY not set. Defaulting to 'General'.")
-        return "General"
+        print("Warning: GROQ_API_KEY not set. Defaulting to 'general'.")
+        return "general", "low"
 
     prompt = (
-        "You are an expert customer support triage system.\n"
-        "Read the following customer message and classify it into EXACTLY ONE of the following categories:\n"
-        "- Billing\n"
-        "- Bug\n"
-        "- Feature Request\n"
-        "- General\n\n"
-        "Rules:\n"
-        "1. Output ONLY the exact category name.\n"
-        "2. Do not include any extra text, punctuation, or explanations.\n\n"
-        f"Customer Message: '{message}'"
+        "Classify the following customer support message.\n"
+        "Categories: billing, fraud, loan, card_issue, technical, general\n"
+        "Priorities: low, medium, high\n"
+        "Output ONLY in this exact format:\n"
+        "category: <category>\n"
+        "priority: <priority>\n\n"
+        f"Message: '{message}'"
     )
 
     try:
@@ -55,37 +97,54 @@ async def classify_ticket(message: str) -> str:
                     "content": prompt,
                 }
             ],
-            model="llama-3.1-8b-instant", # Updated to a supported model
-            temperature=0.0, # Zero temperature for deterministic output
-            max_tokens=10,
+            model="llama-3.1-8b-instant",
+            temperature=0.0,
+            max_tokens=50,
         )
         
-        category = response.choices[0].message.content.strip()
+        content = response.choices[0].message.content.lower()
         
-        # Ensure it's one of the valid categories, otherwise default to General
-        valid_categories = ["Billing", "Bug", "Feature Request", "General"]
-        if category in valid_categories:
-            return category
-        else:
-            print(f"Unexpected AI output: '{category}'. Defaulting to 'General'.")
-            return "General"
+        category = "general"
+        priority = "low"
+        
+        cat_match = re.search(r"category:\s*(billing|fraud|loan|card_issue|technical|general)", content)
+        if cat_match:
+            category = cat_match.group(1)
+            
+        pri_match = re.search(r"priority:\s*(low|medium|high)", content)
+        if pri_match:
+            priority = pri_match.group(1)
+
+        return category, priority
 
     except Exception as e:
         print(f"Error during Groq API call: {e}")
-        return "General"
+        return "general", "low"
 
 
-async def notify_slack(ticket: TicketPayload, category: str):
+def route_ticket(category: str) -> str:
+    routes = {
+        "fraud": "fraud/security team",
+        "billing": "finance team",
+        "loan": "loan department",
+        "card_issue": "card support",
+        "technical": "technical support",
+        "general": "shared inbox"
+    }
+    return routes.get(category, "shared inbox")
+
+
+async def notify_slack(ticket: TicketPayload, category: str) -> bool:
     """
     Helper function to send a JSON payload to Slack Webhook using httpx.
     """
     if not SLACK_WEBHOOK_URL:
         print("Warning: SLACK_WEBHOOK_URL is not set. Cannot send to Slack.")
-        return
+        return False
         
     payload = {
-        "text": f"🚨 *New Bug Reported*\n"
-                f"*Customer:* {ticket.customer_name} ({ticket.customer_email})\n"
+        "text": f"🚨 *New Technical Issue Reported*\n"
+                f"*Customer:* {ticket.name} ({ticket.email})\n"
                 f"*Message:* {ticket.message}"
     }
 
@@ -93,37 +152,67 @@ async def notify_slack(ticket: TicketPayload, category: str):
         try:
             response = await client.post(SLACK_WEBHOOK_URL, json=payload)
             response.raise_for_status()
-            print("Successfully sent bug report to Slack.")
-        except httpx.HTTPError as e:
+            print("Successfully sent technical report to Slack.")
+            return True
+        except Exception as e:
             print(f"Failed to send to Slack webhook: {e}")
+            return False
 
 
 @app.post("/api/ticket")
 async def create_ticket(ticket: TicketPayload):
-    # 1. Classify the message using AI
-    category = await classify_ticket(ticket.message)
-    print(f"AI Classification Result: {category}")
-
-    # 2. IF/Switch Branching Logic based on category
-    if category == "Bug":
-        await notify_slack(ticket, category)
-        action_message = "Bug notification sent to Slack."
+    # 1. Validation
+    validation_status, validation_errors = validate_input(ticket)
+    
+    # 2. AI Classification & Routing & Delivery
+    if validation_status == "Valid":
+        category, priority = await classify_ticket(ticket.message)
+        route = route_ticket(category)
         
-    elif category == "Billing":
-        print("Simulating email to Finance Department")
-        action_message = "Simulated email to Finance Department."
-        
-    elif category == "Feature Request" or category == "General":
-        print("Simulating email to Shared Inbox")
-        action_message = "Simulated email to Shared Inbox."
-        
+        # 3. IF/Switch Branching Logic based on category (HW1/HW2 logic preserved)
+        if category == "technical":
+            success = await notify_slack(ticket, category)
+            delivery_status = "success" if success else "failed"
+            action_message = "Notification sent to Slack." if success else "Failed to send Slack notification."
+        else:
+            print(f"Simulating email to {route}")
+            delivery_status = "success"
+            action_message = f"Simulated email to {route}."
     else:
-        # Fallback (should not happen due to validation in classify_ticket)
-        print("Simulating email to Shared Inbox")
-        action_message = "Simulated email to Shared Inbox."
+        category, priority, route, delivery_status = "none", "none", "none", "none"
+        action_message = "Ticket invalid. Saved as Invalid."
+
+    # 4. Save metadata to Google Sheets
+    timestamp = datetime.now().isoformat()
+    record = [
+        timestamp,
+        ticket.name,
+        ticket.email,
+        ticket.message,
+        validation_status,
+        ", ".join(validation_errors),
+        category,
+        priority,
+        route,
+        delivery_status
+    ]
+    
+    if sheet:
+        try:
+            # Sync gspread call inside async function (keep it simple as requested)
+            sheet.append_row(record)
+        except Exception as e:
+            print(f"Failed to save to Google Sheets: {e}")
+    else:
+        print("Google Sheets not configured, record not saved.")
 
     return {
         "status": "success",
+        "validation_status": validation_status,
+        "validation_errors": validation_errors,
         "category_assigned": category,
+        "priority_assigned": priority,
+        "route": route,
+        "delivery_status": delivery_status,
         "action_taken": action_message
     }
