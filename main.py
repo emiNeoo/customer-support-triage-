@@ -18,11 +18,9 @@ except ImportError:
 # Load environment variables from .env file
 load_dotenv()
 
-# Get environment variables
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 
-# Initialize FastAPI app
 app = FastAPI(title="Customer Support Triage API")
 
 # Initialize Groq client
@@ -90,7 +88,6 @@ async def classify_ticket(message: str) -> tuple[str, str]:
         "priority: <priority>\n\n"
         f"Message: '{message}'"
     )
-
     try:
         response = await groq_client.chat.completions.create(
             messages=[
